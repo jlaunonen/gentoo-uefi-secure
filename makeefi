@@ -1,0 +1,113 @@
+#!/bin/bash
+# v1.0
+
+# Copyright (c) 2019, 2020 Jyrki Launonen
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+
+# -- Config --
+EFI="/mnt/efi"
+MAKEOPTS="-j8"
+
+# -- End of config --
+
+
+# Some simple help.
+if [ -z "$1" -o "$1" = "--help" ]; then
+	echo "$0 0"
+	echo "$0 [1] [2] [3]"
+	echo " 0 : Only show parsed kernel version (useful to check the parsing is not broken)."
+	echo " 1 : Make and patch initramfs with gpg."
+	echo " 2 : Patch (INITRAMFS_SOURCE) kernel config, make kernel and install modules."
+	echo " 3 : Install built kernel to EFI USB stick."
+	exit 1
+fi
+
+set -eu
+
+# Parse kernel main version.
+CUR=$(readlink -f .)
+if [ "${CUR#/usr/src/}" = "${CUR}" ]; then
+	echo "This must be run in the kernel source directory, usually /usr/src/linux"
+	exit 1
+fi
+THIS=$(basename "${CUR}" | cut -f 2 -d -)
+
+echo "Kernel version: $THIS"
+
+if [ "$1" = "0" ]; then
+	exit 0
+fi
+
+# Ensure we can do what we need.
+if [ "$(id -u)" -ne 0 ]; then
+	echo "This must be run as root."
+	exit 1
+fi
+
+set -x
+
+pt1() {
+	make ${MAKEOPTS} modules
+	genkernel --no-install --no-mountboot --luks --lvm --no-gpg --udev --busybox --no-compress-initramfs --all-ramdisk-modules --firmware --no-postclear initramfs
+
+	mkdir -p /tmp/initrd
+	cd /tmp/initrd/
+	cp -v /var/tmp/genkernel/initramfs-${THIS}-gentoo .
+
+	tar -xf /usr/portage/packages/app-crypt/gnupg-1.4*.tbz2 ./usr/bin/gpg
+	echo usr/bin/gpg | cpio -H newc -o --append -F initramfs-*
+	mv initramfs-${THIS}-gentoo{,.cpio}
+	mv initramfs-*.cpio /var/tmp/genkernel/
+	cd -
+}
+
+pt2() {
+	sed -i -e 's|^CONFIG_INITRAMFS_SOURCE=.*$|CONFIG_INITRAMFS_SOURCE="/var/tmp/genkernel/initramfs-'${THIS}'-gentoo.cpio"|;' .config
+	make ${MAKEOPTS} && make modules_install
+}
+
+pt3() {
+	local MOUNTED=""
+	if findmnt "${EFI}" >/dev/null; then MOUNTED=1; fi
+
+	[[ -z "${MOUNTED}" ]] && mount "${EFI}"
+	if [ -e "${EFI}/EFI/Boot/bootx86.efi" ]; then
+		mv "${EFI}"/EFI/Boot/bootx86{.efi,-old.efi}
+	fi
+	cp -aLvn arch/x86_64/boot/bzImage "${EFI}"/EFI/Boot/bootx86.efi
+	sync
+	ls -l "${EFI}"/EFI/Boot/
+	[[ -z "${MOUNTED}" ]] && umount "${EFI}"
+}
+
+
+if [ "$1" = "1" ]; then
+	pt1
+	shift
+fi
+if [ "$1" = "2" ]; then
+	pt2
+	shift
+fi
+if [ "$1" = "3" ]; then
+	pt3
+	shift
+fi
